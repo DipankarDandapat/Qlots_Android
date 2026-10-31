@@ -1,0 +1,14 @@
+<resources>
+    <style name="Theme.Qlots" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@color/splashscreen_background</item>
+        <item name="android:navigationBarColor">@android:color/white</item>
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+
+    <style name="Theme.Qlots.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/splashscreen_background</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/splashscreen_logo</item>
+        <item name="windowSplashScreenIconBackgroundColor">@color/splashscreen_background</item>
+        <item name="postSplashScreenTheme">@style/Theme.Qlots</item>
+    </style>
+</resources>

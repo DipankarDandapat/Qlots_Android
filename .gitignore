@@ -1,0 +1,25 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+local.properties
+*.jks
+*.keystore
+
+# Python local state
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+qlots.db
+qlots.db-journal
+test_qlots.db
+
+# Android/Gradle build state
+.gradle/
+**/build/
+**/.cxx/
+*.apk
+*.aab
+*.apks
