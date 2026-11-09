@@ -4,7 +4,7 @@ import logging
 import os
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,8 @@ if DATABASE_URL.startswith("sqlite"):
     def set_sqlite_pragmas(dbapi_conn, _):
         dbapi_conn.execute("PRAGMA journal_mode=DELETE")
         dbapi_conn.execute("PRAGMA synchronous=NORMAL")
+        # SQLite ignores ON DELETE CASCADE unless this is on; without it deleting an account leaves orphaned rows.
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
@@ -81,3 +83,30 @@ def run_migrations():
                     logger.info(f"Migration: added entries.{col}")
             except Exception:
                 pass
+
+
+def _ensure_columns(table: str, columns: list[tuple[str, str]]) -> None:
+    """Add missing columns to an existing table (create_all only creates new tables)."""
+    try:
+        existing = {c["name"] for c in inspect(engine).get_columns(table)}
+    except Exception:
+        return
+    with engine.connect() as conn:
+        for name, ddl in columns:
+            if name in existing:
+                continue
+            try:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+                conn.commit()
+                logger.info("Migration: added %s.%s", table, name)
+            except Exception:
+                logger.exception("Migration failed for %s.%s", table, name)
+
+
+def run_v3_migrations() -> None:
+    _ensure_columns("snapshots", [
+        ("assets", "FLOAT"), ("liabilities", "FLOAT"),
+        ("monthly_income", "FLOAT"), ("monthly_expenses", "FLOAT"),
+        ("monthly_emi", "FLOAT"), ("monthly_investment", "FLOAT"),
+        ("source", "VARCHAR(12) DEFAULT 'auto'"), ("note", "VARCHAR(200) DEFAULT ''"),
+    ])

@@ -4,37 +4,62 @@ from datetime import date
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models.models import Assumptions, Entry, Snapshot
+from models.models import Assumptions, Entry
+from services.dates import add_months, financial_year_end, financial_year_label, today_local
+
+CASH_CATS = ("cash", "bank_balance", "savings")
+PROPERTY_CATS = ("property", "real_estate")
+DEPOSIT_CATS = ("fixed_deposit", "recurring_deposit")
+FREQ_PER_YEAR = {"daily": 365, "weekly": 52, "monthly": 12, "quarterly": 4, "half_yearly": 2, "yearly": 1}
+HORIZON_YEARS = (1, 2, 3, 5)
 
 
 def annualized(amount: float, frequency: str) -> float:
-    return amount * {"daily": 365, "weekly": 52, "monthly": 12, "quarterly": 4, "half_yearly": 2, "yearly": 1}.get(frequency, 12)
+    return amount * FREQ_PER_YEAR.get(frequency, 12)
+
+
+def rd_months(entry: Entry, on_date: date | None = None) -> int:
+    """Whole instalments counted for a recurring deposit up to `on_date` (capped at maturity)."""
+    if not entry.start_date:
+        return 0
+    valuation_date = on_date or today_local()
+    end_date = min(valuation_date, entry.maturity_date) if entry.maturity_date else valuation_date
+    return max(0, (end_date.year - entry.start_date.year) * 12 + end_date.month - entry.start_date.month)
 
 
 def rd_value(entry: Entry, on_date: date | None = None) -> float:
+    """Recurring deposit as an annuity-due: instalment * ((1+i)^n - 1)/i * (1+i), i = rate/12.
+
+    n instalments are paid at the start of n consecutive months and compound until the end of month n,
+    which matches how a bank's maturity amount is built.
+    """
     instalment = entry.principal or entry.amount
     if instalment <= 0 or not entry.start_date or entry.annual_rate <= 0:
         return entry.amount
-    valuation_date = on_date or date.today()
-    end_date = min(valuation_date, entry.maturity_date) if entry.maturity_date else valuation_date
-    months = max(0, (end_date.year - entry.start_date.year) * 12 + end_date.month - entry.start_date.month)
+    months = rd_months(entry, on_date)
     r = entry.annual_rate / 1200
-    if r == 0:
-        return instalment * months
     return instalment * ((1 + r) ** months - 1) / r * (1 + r)
 
 
+def fd_years(entry: Entry, on_date: date | None = None) -> float:
+    valuation_date = on_date or today_local()
+    end_date = min(valuation_date, entry.maturity_date) if entry.maturity_date else valuation_date
+    if not entry.start_date:
+        return 0.0
+    return max(0, (end_date - entry.start_date).days) / 365.2425
+
+
+def fd_periods(entry: Entry) -> int:
+    return {"daily": 365, "monthly": 12, "quarterly": 4, "half_yearly": 2, "yearly": 1}.get(entry.frequency, 4)
+
+
 def fd_value(entry: Entry, on_date: date | None = None) -> float:
+    """Fixed deposit: P * (1 + r/n)^(n*t). Growth stops at the maturity date."""
     principal = entry.principal or entry.amount
     if principal <= 0 or not entry.start_date or entry.annual_rate <= 0:
         return entry.amount
-    valuation_date = on_date or date.today()
-    rate = entry.annual_rate / 100
-    periods = {"daily": 365, "monthly": 12, "quarterly": 4, "half_yearly": 2, "yearly": 1}.get(entry.frequency, 4)
-    end_date = min(valuation_date, entry.maturity_date) if entry.maturity_date else valuation_date
-    elapsed_days = max(0, (end_date - entry.start_date).days)
-    years = elapsed_days / 365.2425
-    return principal * (1 + rate / periods) ** (periods * years)
+    periods = fd_periods(entry)
+    return principal * (1 + entry.annual_rate / 100 / periods) ** (periods * fd_years(entry, on_date))
 
 
 def entry_value(entry: Entry, on_date: date | None = None) -> float:
@@ -89,114 +114,106 @@ def get_assumptions(db: Session, user_id: int) -> Assumptions:
     return row
 
 
-def project(assets: list[Entry], liabilities: list[Entry], income: list[Entry], expenses: list[Entry], assumptions: Assumptions, years: int, scenario: str = "base") -> dict:
-    scenario = scenario.lower()
-    return_factor = {"conservative": 0.65, "base": 1.0, "optimistic": 1.25}.get(scenario, 1.0)
-    property_rate = assumptions.property_growth / 100 * return_factor
-    equity_rate = assumptions.equity_return / 100 * return_factor
-    years = max(1, min(years, 10))
-    monthly_income = monthly_flow(income, "income")
-    monthly_expenses = monthly_flow(expenses, "expense")
-    monthly_emi = sum(x.emi for x in liabilities if x.emi > 0)
-    investment = assumptions.monthly_investment
-    liquid_cash = sum(entry_value(a) for a in assets if a.category in ("cash", "bank_balance", "savings"))
-    projected_by_year = []
-    for target_year in range(1, years + 1):
-        months = target_year * 12
-        asset_total = 0.0
-        today_proj = date.today()
-        for asset in assets:
-            if asset.category in ("fixed_deposit", "recurring_deposit"):
-                try:
-                    future_date = date(today_proj.year + target_year, today_proj.month, today_proj.day)
-                except ValueError:
-                    future_date = date(today_proj.year + target_year, today_proj.month, 28)
-                asset_total += entry_value(asset, future_date)
-                continue
-            current = entry_value(asset)
-            if asset.category in ("property", "real_estate"):
-                annual_rate = property_rate
-            elif asset.category in ("cash", "bank_balance", "savings"):
-                annual_rate = 0
-            elif asset.growth_rate != 0:
-                annual_rate = asset.growth_rate / 100
-            elif asset.annual_rate > 0:
-                annual_rate = asset.annual_rate / 100 * return_factor
-            else:
-                annual_rate = equity_rate
-            asset_total += current * (1 + annual_rate) ** target_year
-        investment_fv = investment * (((1 + equity_rate / 12) ** months - 1) / (equity_rate / 12)) if equity_rate else investment * months
-        cumulative_cash_flow = 0.0
-        for year_step in range(target_year):
-            income_growth = (1 + assumptions.salary_growth / 100) ** year_step
-            expense_growth = (1 + assumptions.inflation / 100) ** year_step
-            monthly_net = monthly_income * income_growth - monthly_expenses * expense_growth - monthly_emi - investment
-            cumulative_cash_flow += 12 * monthly_net
-        projected_cash = liquid_cash + cumulative_cash_flow
-        overdraft = max(0.0, -projected_cash)
-        cash_delta = max(0.0, projected_cash) - liquid_cash
-        asset_total += investment_fv + cash_delta
-        debt_total = sum(
-            loan_balance_after(x.amount, x.annual_rate, x.emi, min(months, x.tenure_months) if x.tenure_months > 0 else months)
-            for x in liabilities
-        ) + overdraft
-        projected_by_year.append({"year": target_year, "assets": round(asset_total, 2), "liabilities": round(debt_total, 2), "net_worth": round(asset_total - debt_total, 2)})
+def assumptions_dict(assumptions: Assumptions) -> dict:
     return {
-        "scenario": scenario if scenario in ("conservative", "base", "optimistic") else "base",
-        "assumptions": {"salary_growth": assumptions.salary_growth, "equity_return": assumptions.equity_return, "property_growth": assumptions.property_growth, "inflation": assumptions.inflation, "monthly_investment": investment},
-        "monthly_income": round(monthly_income, 2), "monthly_expenses": round(monthly_expenses, 2),
-        "monthly_emi": round(monthly_emi, 2), "projections": projected_by_year,
+        "salary_growth": assumptions.salary_growth, "equity_return": assumptions.equity_return,
+        "property_growth": assumptions.property_growth, "inflation": assumptions.inflation,
+        "monthly_investment": assumptions.monthly_investment,
     }
 
 
-def health_score(assets: list[Entry], liabilities: list[Entry], income: list[Entry], expenses: list[Entry]) -> dict:
+def project(assets: list[Entry], liabilities: list[Entry], income: list[Entry], expenses: list[Entry], assumptions: Assumptions, years: int, scenario: str = "base") -> dict:
+    """Year-end net-worth projection. Delegates to the month-by-month engine in services/engine.py."""
+    from services.engine import SCENARIO_FACTOR, simulate
+
+    scenario = scenario.lower()
+    years = max(1, min(years, 10))
+    sim = simulate(assets, liabilities, income, expenses, assumptions, years * 12, scenario if scenario in SCENARIO_FACTOR else "base")
+    inflation = assumptions.inflation / 100
+    start = sim["start"]
+    rows = []
+    for year in range(1, years + 1):
+        point = sim["points"][year * 12]
+        rows.append({
+            "year": year,
+            "date": add_months(start, year * 12).isoformat(),
+            "financial_year": financial_year_label(add_months(start, year * 12)),
+            "financial_year_end": financial_year_end(add_months(start, year * 12)).isoformat(),
+            "assets": round(point["assets"], 2),
+            "liabilities": round(point["liabilities"], 2),
+            "net_worth": round(point["net_worth"], 2),
+            "real_net_worth": round(point["net_worth"] / (1 + inflation) ** year, 2),
+        })
     monthly_income = monthly_flow(income, "income")
     monthly_expenses = monthly_flow(expenses, "expense")
-    monthly_emi = sum(x.emi for x in liabilities)
+    return {
+        "scenario": scenario if scenario in SCENARIO_FACTOR else "base",
+        "as_of": start.isoformat(),
+        "assumptions": assumptions_dict(assumptions),
+        "monthly_income": round(monthly_income, 2), "monthly_expenses": round(monthly_expenses, 2),
+        "monthly_emi": round(sum(x.emi for x in liabilities if x.emi > 0), 2), "projections": rows,
+    }
+
+
+def health_from_metrics(monthly_income: float, monthly_expenses: float, monthly_emi: float, liquid: float, non_cash_categories: int, has_data: bool = True) -> dict:
     monthly_surplus = monthly_income - monthly_expenses - monthly_emi
-    if not (assets or liabilities or income or expenses):
+    if not has_data:
         return {"score": 0, "label": "Building", "metrics": {"savings_rate_pct": 0, "debt_to_income_pct": 0, "emergency_fund_months": 0, "monthly_surplus": 0}, "disclaimer": "Add your assets, income and expenses to get a financial health score."}
     savings_rate = (monthly_surplus / monthly_income * 100) if monthly_income else 0
     dti = (monthly_emi / monthly_income * 100) if monthly_income else 0
-    liquid = sum(entry_value(a) for a in assets if a.category in ("cash", "bank_balance", "savings"))
     emergency_months = liquid / monthly_expenses if monthly_expenses else 0
     score = 0
     score += min(25, max(0, savings_rate) * 0.5)
     score += max(0, 25 - min(25, dti * 0.6)) if monthly_income > 0 else 0
     score += min(20, emergency_months * 5)
-    non_cash = [a for a in assets if a.category not in ("cash", "bank_balance", "savings")]
-    score += 15 if len({a.category for a in non_cash}) >= 3 else min(15, len({a.category for a in non_cash}) * 5)
+    score += 15 if non_cash_categories >= 3 else min(15, non_cash_categories * 5)
     score += 15 if monthly_surplus > 0 else (7 if monthly_surplus == 0 and monthly_income > 0 else 0)
     score = round(min(100, max(0, score)))
     return {"score": score, "label": "Building" if score < 50 else "Steady" if score < 75 else "Strong", "metrics": {"savings_rate_pct": round(savings_rate, 1), "debt_to_income_pct": round(dti, 1), "emergency_fund_months": round(emergency_months, 1), "monthly_surplus": round(monthly_surplus, 2)}, "disclaimer": "An educational indicator based on the information entered—not professional financial advice."}
 
 
+def health_score(assets: list[Entry], liabilities: list[Entry], income: list[Entry], expenses: list[Entry]) -> dict:
+    liquid = sum(entry_value(a) for a in assets if a.category in CASH_CATS)
+    non_cash = len({a.category for a in assets if a.category not in CASH_CATS})
+    return health_from_metrics(
+        monthly_flow(income, "income"), monthly_flow(expenses, "expense"),
+        sum(x.emi for x in liabilities), liquid, non_cash,
+        has_data=bool(assets or liabilities or income or expenses),
+    )
+
+
+def totals_for(assets: list[Entry], liabilities: list[Entry], on_date: date | None = None) -> tuple[float, float]:
+    return sum(entry_value(a, on_date) for a in assets), sum(l.amount for l in liabilities)
+
+
 def dashboard_data(db: Session, user_id: int, user_name: str) -> dict:
-    from models.models import Snapshot
+    from services.snapshots import record_auto_snapshot
+
     assets, liabilities, income, expenses = collect_finances(db, user_id)
     assumptions = get_assumptions(db, user_id)
-    total_assets = sum(entry_value(a) for a in assets)
-    total_liabilities = sum(l.amount for l in liabilities)
+    today = today_local()
+    total_assets, total_liabilities = totals_for(assets, liabilities, today)
     monthly_income = monthly_flow(income, "income")
     monthly_expenses = monthly_flow(expenses, "expense")
+    emi_total = sum(l.emi for l in liabilities)
     forecast = project(assets, liabilities, income, expenses, assumptions, 5)
-    today = date.today()
-    existing = db.scalar(select(Snapshot).where(Snapshot.user_id == user_id, Snapshot.snapshot_date == today))
-    if existing:
-        existing.net_worth = total_assets - total_liabilities
-    else:
-        db.add(Snapshot(user_id=user_id, snapshot_date=today, net_worth=total_assets - total_liabilities))
-    db.commit()
+    by_year = {row["year"]: row for row in forecast["projections"]}
+    record_auto_snapshot(db, user_id, today, "auto", assets, liabilities, income, expenses, assumptions)
     allocation: dict[str, float] = {}
     for a in assets:
-        allocation[a.category] = allocation.get(a.category, 0) + entry_value(a)
+        allocation[a.category] = allocation.get(a.category, 0) + entry_value(a, today)
     return {
-        "currency": "INR", "as_of": today.isoformat(),
+        "currency": "INR", "as_of": today.isoformat(), "refreshes": "Net worth is re-calculated automatically every night at 12:00 AM IST.",
         "totals": {"assets": round(total_assets, 2), "liabilities": round(total_liabilities, 2), "net_worth": round(total_assets - total_liabilities, 2)},
-        "monthly": {"income": round(monthly_income, 2), "expenses": round(monthly_expenses, 2), "emi": round(sum(l.emi for l in liabilities), 2), "surplus": round(monthly_income - monthly_expenses - sum(l.emi for l in liabilities), 2)},
+        "monthly": {"income": round(monthly_income, 2), "expenses": round(monthly_expenses, 2), "emi": round(emi_total, 2), "surplus": round(monthly_income - monthly_expenses - emi_total, 2)},
         "asset_breakdown": [{"category": k, "value": round(v, 2)} for k, v in sorted(allocation.items(), key=lambda kv: -kv[1])],
         "assets": [entry_dict(a) for a in assets],
         "liabilities": [entry_dict(l) for l in liabilities],
-        "projections": {"one_year": forecast["projections"][0], "five_year": forecast["projections"][4], "assumptions": forecast["assumptions"], "disclaimer": "Model-based projections; actual outcomes may differ and are not guaranteed."},
+        "projections": {
+            "one_year": by_year[1], "two_year": by_year[2], "three_year": by_year[3], "five_year": by_year[5],
+            "horizons": [by_year[y] for y in HORIZON_YEARS],
+            "assumptions": forecast["assumptions"],
+            "disclaimer": "Model-based projections; actual outcomes may differ and are not guaranteed.",
+        },
         "health": health_score(assets, liabilities, income, expenses),
     }

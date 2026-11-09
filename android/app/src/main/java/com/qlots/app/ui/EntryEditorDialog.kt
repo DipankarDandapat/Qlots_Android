@@ -169,7 +169,7 @@ private fun FrequencyChoices(options: List<String>, selected: String, onSelect: 
 }
 
 @Composable
-private fun DatePickerField(label: String, value: String, onValueChange: (String) -> Unit, optional: Boolean = false) {
+internal fun DatePickerField(label: String, value: String, onValueChange: (String) -> Unit, optional: Boolean = false) {
     val context = LocalContext.current
     val calendar = remember(value) {
         Calendar.getInstance().apply {

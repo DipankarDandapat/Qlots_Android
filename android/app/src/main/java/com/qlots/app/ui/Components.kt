@@ -1,6 +1,10 @@
 package com.qlots.app.ui
 
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.runtime.remember
+import androidx.compose.ui.composed
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -230,19 +234,20 @@ fun EmptyState(title: String, body: String) {
 
 fun money(value: Double, compact: Boolean = false): String {
     if (!value.isFinite()) return "₹0"
+    val sign = if (value < 0 && kotlin.math.abs(value) >= 0.5) "-" else ""
+    val absolute = kotlin.math.abs(value)
     if (compact) {
-        val absolute = kotlin.math.abs(value)
         val formatter = DecimalFormat("0.##")
-        return when {
-            absolute >= 10_000_000 -> "₹${formatter.format(value / 10_000_000)} Cr"
-            absolute >= 100_000 -> "₹${formatter.format(value / 100_000)} L"
-            absolute >= 1_000 -> "₹${formatter.format(value / 1_000)} K"
-            else -> "₹${NumberFormat.getNumberInstance(Locale.forLanguageTag("en-IN")).format(value.roundToWhole())}"
+        return sign + when {
+            absolute >= 10_000_000 -> "₹${formatter.format(absolute / 10_000_000)} Cr"
+            absolute >= 100_000 -> "₹${formatter.format(absolute / 100_000)} L"
+            absolute >= 1_000 -> "₹${formatter.format(absolute / 1_000)} K"
+            else -> "₹${NumberFormat.getNumberInstance(Locale.forLanguageTag("en-IN")).format(absolute.roundToWhole())}"
         }
     }
     val fmt = NumberFormat.getNumberInstance(Locale.forLanguageTag("en-IN"))
     fmt.maximumFractionDigits = 0
-    return "₹${fmt.format(value.roundToWhole())}"
+    return sign + "₹${fmt.format(absolute.roundToWhole())}"
 }
 
 private fun Double.roundToWhole(): Long = kotlin.math.round(this).toLong()
@@ -254,4 +259,8 @@ fun labelize(raw: String): String = raw.replace('_', ' ').split(' ').filter { it
         "rd" -> "RD"
         else -> word.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
     }
+}
+
+fun Modifier.clickableNoRipple(onClick: () -> Unit): Modifier = composed {
+    clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onClick)
 }

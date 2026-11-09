@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -17,7 +18,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountBalanceWallet
 import androidx.compose.material.icons.rounded.BarChart
-import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.PieChart
 import androidx.compose.material.icons.automirrored.rounded.TrendingUp
 import androidx.compose.material3.Icon
@@ -49,6 +49,9 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.qlots.app.data.EntryRecord
+import com.qlots.app.data.GoalItem
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import java.io.File
 
 @Composable
@@ -63,6 +66,16 @@ fun QlotsApp(viewModel: QlotsViewModel = viewModel()) {
     var pendingDelete by remember { mutableStateOf<EntryRecord?>(null) }
     var showDeleteAccount by remember { mutableStateOf(false) }
     var showDeleteData by remember { mutableStateOf(false) }
+    var showSnapshot by remember { mutableStateOf(false) }
+    var showSavePlan by remember { mutableStateOf(false) }
+    var showGoalEditor by remember { mutableStateOf(false) }
+    var editingGoal by remember { mutableStateOf<GoalItem?>(null) }
+    var goalSuggestion by remember { mutableStateOf<Double?>(null) }
+    var progressGoal by remember { mutableStateOf<GoalItem?>(null) }
+    var outlookRequest by remember { mutableStateOf<OutlookRequest?>(null) }
+
+    // If the phone was asleep over midnight, reload as soon as the app is back so "as of today" is today.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { viewModel.refreshIfDateChanged() }
 
     LaunchedEffect(state.message) {
         val message = state.message
@@ -149,6 +162,7 @@ fun QlotsApp(viewModel: QlotsViewModel = viewModel()) {
                     onOpenWealth = { viewModel.selectTab(AppTab.WEALTH) },
                     onOpenCashflow = { viewModel.selectTab(AppTab.CASHFLOW) },
                     onOpenPlan = { viewModel.selectTab(AppTab.PLAN) },
+                    onOpenOutlook = { years -> outlookRequest = OutlookRequest(years) },
                 )
                 AppTab.WEALTH -> WealthScreen(
                     entries = state.entries,
@@ -163,13 +177,41 @@ fun QlotsApp(viewModel: QlotsViewModel = viewModel()) {
                     onEdit = openEdit,
                     onDelete = { pendingDelete = it },
                 )
-                AppTab.HISTORY -> HistoryScreen(history = state.history)
+                AppTab.INSIGHTS -> InsightsScreen(
+                    state = state,
+                    onRecordSnapshot = { showSnapshot = true },
+                    onDeleteSnapshot = viewModel::deleteSnapshot,
+                    onSelectPlan = viewModel::selectPlan,
+                    onSavePlan = { showSavePlan = true },
+                    onDeletePlan = viewModel::deletePlan,
+                    onAddGoal = { editingGoal = null; goalSuggestion = null; showGoalEditor = true },
+                    onEditGoal = { editingGoal = it; goalSuggestion = null; showGoalEditor = true },
+                    onProgress = { progressGoal = it },
+                    onDeleteGoal = { viewModel.deleteGoal(it.id) },
+                    onConsumeSection = viewModel::consumeSection,
+                )
                 AppTab.PLAN -> PlanScreen(
                     state = state,
-                    onSaveAssumptions = viewModel::saveAssumptionsAndCalculate,
-                    onScenario = viewModel::runScenario,
-                    onAskHelper = viewModel::askHelper,
-                    onCreatePdf = { viewModel.createPdf { bytes -> sharePdf(context, bytes) } },
+                    actions = PlanActions(
+                        onSaveAssumptions = viewModel::saveAssumptionsAndCalculate,
+                        onScenario = viewModel::runScenario,
+                        onAskHelper = viewModel::askHelper,
+                        onCreatePdf = { viewModel.createPdf { bytes -> sharePdf(context, bytes) } },
+                        onRunOutlook = { years, save, loan, equity -> viewModel.runOutlook(years, save, loan, equity, null, null) },
+                        onViewCalculation = { outlookRequest = it },
+                        onWhatIf = viewModel::runWhatIf,
+                        onEmergency = viewModel::loadEmergency,
+                        onCreateEmergencyGoal = { target ->
+                            editingGoal = null
+                            goalSuggestion = target
+                            showGoalEditor = true
+                            viewModel.selectTab(AppTab.INSIGHTS, InsightSection.GOALS.name)
+                        },
+                        onGoalCalc = viewModel::runGoalCalc,
+                        onLoanPayoff = viewModel::runLoanPayoff,
+                        onOpenWealth = { viewModel.selectTab(AppTab.WEALTH) },
+                        onConsumeSection = viewModel::consumeSection,
+                    ),
                 )
             }
             if (state.busy) {
@@ -189,6 +231,39 @@ fun QlotsApp(viewModel: QlotsViewModel = viewModel()) {
             busy = state.busy,
             onDismiss = { showEditor = false },
             onSave = { entry -> viewModel.saveEntry(entry, editingEntry?.id) { showEditor = false } },
+        )
+    }
+    if (showSnapshot) {
+        SnapshotDialog(
+            busy = state.busy,
+            currentAssets = state.dashboard?.totalAssets ?: 0.0,
+            currentLiabilities = state.dashboard?.totalLiabilities ?: 0.0,
+            onDismiss = { showSnapshot = false },
+            onSave = { date, assets, liabilities, note -> viewModel.recordSnapshot(date, assets, liabilities, note) { showSnapshot = false } },
+        )
+    }
+    if (showSavePlan) {
+        SavePlanDialog(state.busy, { showSavePlan = false }) { label -> viewModel.savePlan(label); showSavePlan = false }
+    }
+    if (showGoalEditor) {
+        GoalDialog(
+            existing = editingGoal, busy = state.busy, suggestedTarget = goalSuggestion,
+            onDismiss = { showGoalEditor = false },
+            onSave = { g ->
+                if (g.name.isBlank() || g.target <= 0.0) viewModel.notifyError("Add a goal name and a target amount.")
+                else viewModel.saveGoal(g.id, g.name, g.kind, g.target, g.current, g.monthly, g.expectedReturn, g.targetDate, g.autoLink) { showGoalEditor = false }
+            },
+        )
+    }
+    progressGoal?.let { goal ->
+        ProgressDialog(goal, state.busy, { progressGoal = null }) { amount -> viewModel.updateGoalProgress(goal.id, amount) { progressGoal = null } }
+    }
+    outlookRequest?.let { request ->
+        OutlookDetailSheet(
+            request = request,
+            breakdown = state.breakdown,
+            onScenario = { scenario -> viewModel.loadBreakdown(request.years, scenario, request.adjust) },
+            onDismiss = { outlookRequest = null; viewModel.clearBreakdown() },
         )
     }
     pendingDelete?.let { entry ->
@@ -250,7 +325,7 @@ fun QlotsApp(viewModel: QlotsViewModel = viewModel()) {
 private fun TopHeader(displayName: String, busy: Boolean, onRefresh: () -> Unit, onProfile: () -> Unit) {
     Surface(color = QlotsColors.Canvas, shadowElevation = 0.dp) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(start = 19.dp, end = 18.dp, top = 8.dp, bottom = 10.dp),
+            modifier = Modifier.fillMaxWidth().statusBarsPadding().padding(start = 19.dp, end = 18.dp, top = 8.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
