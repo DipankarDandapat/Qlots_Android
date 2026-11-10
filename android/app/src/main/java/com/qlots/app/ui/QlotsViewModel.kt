@@ -4,7 +4,7 @@ import android.app.Application
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountBalanceWallet
 import androidx.compose.material.icons.rounded.BarChart
-import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.Insights
 import androidx.compose.material.icons.rounded.PieChart
 import androidx.compose.material.icons.automirrored.rounded.TrendingUp
 import androidx.lifecycle.AndroidViewModel
@@ -14,12 +14,23 @@ import com.qlots.app.data.ApiException
 import com.qlots.app.data.Assumptions
 import com.qlots.app.data.EntryRecord
 import com.qlots.app.data.FinancialDashboard
+import com.qlots.app.data.BreakdownData
+import com.qlots.app.data.EmergencyPlan
+import com.qlots.app.data.GoalCalcResult
+import com.qlots.app.data.GoalItem
 import com.qlots.app.data.HistorySnapshot
+import com.qlots.app.data.InsightsData
+import com.qlots.app.data.LoanPayoffResult
+import com.qlots.app.data.OutlookData
+import com.qlots.app.data.PlanComparison
+import com.qlots.app.data.PlanInfo
+import com.qlots.app.data.WhatIfResult
 import com.qlots.app.data.ProjectionResponse
 import com.qlots.app.data.QlotsApi
 import com.qlots.app.data.SecureTokenStore
 import com.qlots.app.data.UserProfile
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -32,9 +43,13 @@ enum class AppTab(val title: String, val icon: androidx.compose.ui.graphics.vect
     OVERVIEW("Overview", Icons.Rounded.PieChart),
     WEALTH("Wealth", Icons.Rounded.AccountBalanceWallet),
     CASHFLOW("Cash flow", Icons.Rounded.BarChart),
-    HISTORY("History", Icons.Rounded.History),
+    INSIGHTS("Insights", Icons.Rounded.Insights),
     PLAN("Plan", Icons.AutoMirrored.Rounded.TrendingUp),
 }
+
+data class OutlookAdjust(val extraSave: Double = 0.0, val extraLoan: Double = 0.0, val equity: Double? = null)
+
+data class OutlookRequest(val years: Int, val adjust: OutlookAdjust = OutlookAdjust())
 
 data class QlotsUiState(
     val booting: Boolean = true,
@@ -50,6 +65,19 @@ data class QlotsUiState(
     val forecast: ProjectionResponse? = null,
     val history: List<HistorySnapshot> = emptyList(),
     val helperAnswer: String = "",
+    val insights: InsightsData? = null,
+    val goals: List<GoalItem> = emptyList(),
+    val plans: List<PlanInfo> = emptyList(),
+    val comparison: PlanComparison? = null,
+    val outlook: OutlookData? = null,
+    val breakdown: BreakdownData? = null,
+    val whatIf: WhatIfResult? = null,
+    val payoff: LoanPayoffResult? = null,
+    val emergency: EmergencyPlan? = null,
+    val goalCalc: GoalCalcResult? = null,
+    val lastRefreshed: Long = 0L,
+    val loadedDate: String = "",
+    val sectionRequest: String? = null,
     val message: String? = null,
     val messageIsError: Boolean = false,
 )
@@ -65,14 +93,39 @@ class QlotsViewModel(application: Application) : AndroidViewModel(application) {
             awaitServer()
             restoreSession()
         }
+        // Net worth is re-valued every night at 12:00 AM on the server; the app reloads at the same moment
+        // so "as of today" never shows yesterday's figure.
+        viewModelScope.launch {
+            while (true) {
+                delay(millisUntilNextMidnight() + 4_000)
+                silentReload()
+            }
+        }
+    }
+
+    /** Reload quietly (no spinner or toast) when the calendar day changed while the app was in the background. */
+    fun refreshIfDateChanged() {
+        val current = mutableState.value
+        if (current.token != null && current.loadedDate.isNotEmpty() && current.loadedDate != todayIso()) silentReload()
+    }
+
+    private fun silentReload() {
+        val token = mutableState.value.token ?: return
+        viewModelScope.launch {
+            try { loadAccount(token) } catch (error: Exception) { if ((error as? ApiException)?.statusCode == 401) handleError(error) }
+        }
+    }
+
+    fun consumeSection() {
+        mutableState.value = mutableState.value.copy(sectionRequest = null)
     }
 
     fun clearMessage() {
         mutableState.value = mutableState.value.copy(message = null)
     }
 
-    fun selectTab(tab: AppTab) {
-        mutableState.value = mutableState.value.copy(selectedTab = tab)
+    fun selectTab(tab: AppTab, section: String? = null) {
+        mutableState.value = mutableState.value.copy(selectedTab = tab, sectionRequest = section)
         if (tab == AppTab.PLAN && mutableState.value.forecast == null && mutableState.value.token != null) {
             runScenario("base")
         }
@@ -121,19 +174,52 @@ class QlotsViewModel(application: Application) : AndroidViewModel(application) {
             val entriesRequest = async { api.entries(token) }
             val assumptionsRequest = async { api.get("/api/assumptions", token) }
             val historyRequest = async { api.history(token) }
+            val insightsRequest = async { optional { InsightsData.fromJson(api.get("/api/insights", token)) } }
+            val goalsRequest = async { optional { api.get("/api/goals", token).let { j -> j.optJSONArray("goals")?.let { a -> (0 until a.length()).map { GoalItem.fromJson(a.getJSONObject(it)) } } ?: emptyList() } } }
+            val plansRequest = async { optional { api.get("/api/projection/plans", token).let { j -> j.optJSONArray("plans")?.let { a -> (0 until a.length()).map { PlanInfo.fromJson(a.getJSONObject(it)) } } ?: emptyList() } } }
             val me = UserProfile.fromJson(meRequest.await())
             val dashboard = FinancialDashboard.fromJson(dashboardRequest.await())
             val entries = entriesRequest.await()
             val assumptions = Assumptions.fromJson(assumptionsRequest.await())
             val history = historyRequest.await()
-            mutableState.value = mutableState.value.copy(
+            val plans = plansRequest.await()
+            val previous = mutableState.value
+            mutableState.value = previous.copy(
                 token = token,
                 user = me,
                 dashboard = dashboard,
                 entries = entries,
                 assumptions = assumptions,
                 history = history,
+                insights = insightsRequest.await() ?: previous.insights,
+                goals = goalsRequest.await() ?: previous.goals,
+                plans = plans ?: previous.plans,
+                lastRefreshed = System.currentTimeMillis(),
+                loadedDate = todayIso(),
             )
+            val wanted = previous.comparison?.plan?.id?.takeIf { id -> plans?.any { it.id == id } == true } ?: plans?.firstOrNull()?.id
+            if (wanted != null) optional { loadComparison(token, wanted) }
+        }
+    }
+
+    private suspend fun <T> optional(block: suspend () -> T): T? = try {
+        block()
+    } catch (error: ApiException) {
+        if (error.statusCode == 401) throw error else null
+    } catch (_: Exception) {
+        null
+    }
+
+    private suspend fun loadComparison(token: String, planId: Int) {
+        val comparison = PlanComparison.fromJson(api.get("/api/projection/plans/$planId/vs-actual", token))
+        mutableState.value = mutableState.value.copy(comparison = comparison)
+    }
+
+    private fun launchApi(block: suspend (String) -> Unit) {
+        val token = mutableState.value.token ?: return
+        viewModelScope.launch {
+            setBusy(true)
+            try { block(token) } catch (error: Exception) { handleError(error) } finally { setBusy(false) }
         }
     }
 
@@ -306,6 +392,128 @@ class QlotsViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ------------------------------------------------------------------ snapshots
+    fun recordSnapshot(date: String?, assets: Double?, liabilities: Double?, note: String, onDone: () -> Unit) = launchApi { token ->
+        val body = JSONObject().put("note", note.trim())
+        if (!date.isNullOrBlank()) body.put("snapshot_date", date)
+        if (assets != null) body.put("assets", assets)
+        if (liabilities != null) body.put("liabilities", liabilities)
+        api.post("/api/snapshots", token, body)
+        loadAccount(token)
+        notify("Snapshot recorded.", false)
+        onDone()
+    }
+
+    fun deleteSnapshot(id: Int) = launchApi { token ->
+        api.delete("/api/snapshots/$id", token)
+        loadAccount(token)
+        notify("Snapshot removed.", false)
+    }
+
+    // ------------------------------------------------------------------ projections
+    fun selectPlan(id: Int) = launchApi { token -> loadComparison(token, id) }
+
+    fun savePlan(label: String) = launchApi { token ->
+        val created = api.post("/api/projection/plans", token, JSONObject().put("label", label.trim()))
+        loadAccount(token)
+        loadComparison(token, created.optInt("id"))
+        notify("Projection saved. New snapshots will be compared with it.", false)
+    }
+
+    fun deletePlan(id: Int) = launchApi { token ->
+        api.delete("/api/projection/plans/$id", token)
+        mutableState.value = mutableState.value.copy(comparison = null)
+        loadAccount(token)
+        notify("Saved projection removed.", false)
+    }
+
+    private fun adjustBody(years: Int, extraSave: Double, extraLoan: Double, equity: Double?, salary: Double?, inflation: Double?): JSONObject {
+        val body = JSONObject().put("years", years).put("extra_monthly_saving", extraSave).put("extra_loan_payment", extraLoan)
+        if (equity != null) body.put("equity_return", equity)
+        if (salary != null) body.put("salary_growth", salary)
+        if (inflation != null) body.put("inflation", inflation)
+        return body
+    }
+
+    fun runOutlook(years: Int, extraSave: Double, extraLoan: Double, equity: Double?, salary: Double?, inflation: Double?) = launchApi { token ->
+        val result = api.post("/api/planning/outlook", token, adjustBody(years, extraSave, extraLoan, equity, salary, inflation))
+        mutableState.value = mutableState.value.copy(outlook = OutlookData.fromJson(result))
+    }
+
+    fun loadBreakdown(years: Int, scenario: String, adjust: OutlookAdjust = OutlookAdjust()) {
+        val token = mutableState.value.token ?: return
+        viewModelScope.launch {
+            try {
+                val body = adjustBody(years, adjust.extraSave, adjust.extraLoan, adjust.equity, null, null)
+                val result = api.post("/api/planning/breakdown?scenario=$scenario", token, body)
+                mutableState.value = mutableState.value.copy(breakdown = BreakdownData.fromJson(result))
+            } catch (error: Exception) {
+                handleError(error)
+            }
+        }
+    }
+
+    fun clearBreakdown() {
+        mutableState.value = mutableState.value.copy(breakdown = null)
+    }
+
+    // ------------------------------------------------------------------ planners
+    fun runWhatIf(years: Int, extraSave: Double, extraLoan: Double, purchase: Double, purchaseIn: Int, delay: Int) = launchApi { token ->
+        val body = JSONObject().put("years", years).put("scenario", mutableState.value.scenario).put("extra_monthly_saving", extraSave)
+            .put("extra_loan_payment", extraLoan).put("purchase_amount", purchase).put("purchase_in_months", purchaseIn).put("delay_months", delay)
+        mutableState.value = mutableState.value.copy(whatIf = WhatIfResult.fromJson(api.post("/api/planning/what-if", token, body)))
+    }
+
+    fun runLoanPayoff(extra: Double, targetLoanId: Int?) = launchApi { token ->
+        val body = JSONObject().put("extra_monthly", extra)
+        if (targetLoanId != null) body.put("target_loan_id", targetLoanId)
+        mutableState.value = mutableState.value.copy(payoff = LoanPayoffResult.fromJson(api.post("/api/planning/loan-payoff", token, body)))
+    }
+
+    fun loadEmergency(months: Int, includeEmi: Boolean, buildIn: Int) {
+        val token = mutableState.value.token ?: return
+        viewModelScope.launch {
+            try {
+                val result = api.get("/api/planning/emergency-fund?months=$months&include_emi=$includeEmi&build_in_months=$buildIn", token)
+                mutableState.value = mutableState.value.copy(emergency = EmergencyPlan.fromJson(result))
+            } catch (error: Exception) {
+                handleError(error)
+            }
+        }
+    }
+
+    fun runGoalCalc(target: Double, current: Double, annualReturn: Double, months: Int) = launchApi { token ->
+        val body = JSONObject().put("target_amount", target).put("current_amount", current).put("annual_return", annualReturn).put("months", months)
+        mutableState.value = mutableState.value.copy(goalCalc = GoalCalcResult.fromJson(api.post("/api/planning/goal-contribution", token, body)))
+    }
+
+    // ------------------------------------------------------------------ goals
+    fun saveGoal(
+        id: Int?, name: String, kind: String, target: Double, current: Double, monthly: Double, expectedReturn: Double,
+        targetDate: String?, autoLink: Boolean, onDone: () -> Unit,
+    ) = launchApi { token ->
+        val body = JSONObject().put("name", name.trim()).put("kind", kind).put("target_amount", target).put("current_amount", current)
+            .put("monthly_contribution", monthly).put("expected_return", expectedReturn).put("auto_link_cash", autoLink)
+            .put("target_date", targetDate?.takeIf { it.isNotBlank() } ?: JSONObject.NULL)
+        if (id == null) api.post("/api/goals", token, body) else api.put("/api/goals/$id", token, body)
+        loadAccount(token)
+        notify("Goal saved.", false)
+        onDone()
+    }
+
+    fun updateGoalProgress(id: Int, amount: Double, onDone: () -> Unit) = launchApi { token ->
+        api.post("/api/goals/$id/progress", token, JSONObject().put("current_amount", amount))
+        loadAccount(token)
+        notify("Progress updated.", false)
+        onDone()
+    }
+
+    fun deleteGoal(id: Int) = launchApi { token ->
+        api.delete("/api/goals/$id", token)
+        loadAccount(token)
+        notify("Goal removed.", false)
+    }
+
     fun createPdf(onReady: (ByteArray) -> Unit) {
         val token = mutableState.value.token ?: return
         viewModelScope.launch {
@@ -402,6 +610,8 @@ class QlotsViewModel(application: Application) : AndroidViewModel(application) {
     private fun setBusy(busy: Boolean) {
         mutableState.value = mutableState.value.copy(busy = busy)
     }
+
+    fun notifyError(message: String) = notify(message, true)
 
     private fun notify(message: String, isError: Boolean) {
         mutableState.value = mutableState.value.copy(message = message, messageIsError = isError)

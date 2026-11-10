@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
-from database.db import engine, run_migrations, Base
+from database.db import engine, run_migrations, run_v3_migrations, Base
 from models.models import *  # noqa: F401,F403 — registers all ORM models with Base
 
 logging.basicConfig(level=logging.INFO)
@@ -20,12 +22,25 @@ if APP_ENV == "production" and JWT_SECRET == "qlots-local-development-key-change
 try:
     Base.metadata.create_all(bind=engine)
     run_migrations()
+    run_v3_migrations()
 except Exception:
     logging.exception("Database initialization failed; /health will report db error")
 
+@asynccontextmanager
+async def lifespan(_app):
+    task = None
+    if APP_ENV != "test" and os.getenv("NIGHTLY_REFRESH", "1") != "0":
+        from services.scheduler import nightly_loop
+        task = asyncio.create_task(nightly_loop())
+    yield
+    if task:
+        task.cancel()
+
+
 app = FastAPI(
     title="Qlots API",
-    version="0.1.0",
+    version="0.3.0",
+    lifespan=lifespan,
     description="Local-first personal finance MVP. Projections are estimates, not guarantees.",
 )
 
@@ -41,7 +56,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-from routers import auth, entries, dashboard, projections, advisor, reports, me  # noqa: E402
+from routers import auth, entries, dashboard, projections, advisor, reports, me, insights, planning, goals  # noqa: E402
 
 app.include_router(auth.router)
 app.include_router(entries.router)
@@ -50,6 +65,9 @@ app.include_router(projections.router)
 app.include_router(advisor.router)
 app.include_router(reports.router)
 app.include_router(me.router)
+app.include_router(insights.router)
+app.include_router(planning.router)
+app.include_router(goals.router)
 
 
 @app.get("/health")

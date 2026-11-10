@@ -46,10 +46,7 @@ class QlotsApi(baseUrl: String = BuildConfig.API_BASE_URL, interceptor: Intercep
     suspend fun history(token: String): List<HistorySnapshot> = withContext(Dispatchers.IO) {
         val response = execute("GET", "/api/history", token, null, false)
         val json = JSONArray(String(response, Charsets.UTF_8))
-        (0 until json.length()).map { index ->
-            val row = json.getJSONObject(index)
-            HistorySnapshot(date = row.stringValue("date"), netWorth = row.numberValue("net_worth"))
-        }
+        (0 until json.length()).map { index -> HistorySnapshot.fromJson(json.getJSONObject(index)) }
     }
 
     suspend fun pdfReport(token: String): ByteArray = withContext(Dispatchers.IO) {
@@ -84,20 +81,20 @@ class QlotsApi(baseUrl: String = BuildConfig.API_BASE_URL, interceptor: Intercep
     }
 }
 
-private fun JSONArray.toEntryList(): List<EntryRecord> =
+internal fun JSONArray.toEntryList(): List<EntryRecord> =
     (0 until length()).map { EntryRecord.fromJson(getJSONObject(it)) }
 
-private fun JSONObject.stringValue(key: String, fallback: String = ""): String =
+internal fun JSONObject.stringValue(key: String, fallback: String = ""): String =
     if (isNull(key)) fallback else optString(key, fallback)
 
-private fun JSONObject.nullableStringValue(key: String): String? =
+internal fun JSONObject.nullableStringValue(key: String): String? =
     if (isNull(key)) null else optString(key).takeIf { it.isNotBlank() }
 
-private fun JSONObject.numberValue(key: String, fallback: Double = 0.0): Double = optDouble(key, fallback).let { if (it.isFinite()) it else fallback }
+internal fun JSONObject.numberValue(key: String, fallback: Double = 0.0): Double = optDouble(key, fallback).let { if (it.isFinite()) it else fallback }
 
-private fun JSONObject.objectValue(key: String): JSONObject = optJSONObject(key) ?: JSONObject()
+internal fun JSONObject.objectValue(key: String): JSONObject = optJSONObject(key) ?: JSONObject()
 
-private fun JSONObject.arrayValue(key: String): JSONArray = optJSONArray(key) ?: JSONArray()
+internal fun JSONObject.arrayValue(key: String): JSONArray = optJSONArray(key) ?: JSONArray()
 
 data class UserProfile(
     val id: Int = 0,
@@ -224,6 +221,10 @@ data class NetWorthProjection(
     val assets: Double = 0.0,
     val liabilities: Double = 0.0,
     val netWorth: Double = 0.0,
+    val date: String = "",
+    val financialYearEnd: String = "",
+    val financialYear: String = "",
+    val realNetWorth: Double = 0.0,
 ) {
     companion object {
         fun fromJson(json: JSONObject) = NetWorthProjection(
@@ -231,6 +232,10 @@ data class NetWorthProjection(
             assets = json.numberValue("assets"),
             liabilities = json.numberValue("liabilities"),
             netWorth = json.numberValue("net_worth"),
+            date = json.stringValue("date"),
+            financialYearEnd = json.stringValue("financial_year_end"),
+            financialYear = json.stringValue("financial_year"),
+            realNetWorth = json.numberValue("real_net_worth", json.numberValue("net_worth")),
         )
     }
 }
@@ -238,6 +243,7 @@ data class NetWorthProjection(
 data class DashboardProjectionSet(
     val oneYear: NetWorthProjection = NetWorthProjection(year = 1),
     val fiveYear: NetWorthProjection = NetWorthProjection(year = 5),
+    val horizons: List<NetWorthProjection> = emptyList(),
     val disclaimer: String = "",
 )
 
@@ -271,6 +277,7 @@ data class FinancialDashboard(
                 projections = DashboardProjectionSet(
                     oneYear = NetWorthProjection.fromJson(projectionJson.objectValue("one_year")),
                     fiveYear = NetWorthProjection.fromJson(projectionJson.objectValue("five_year")),
+                    horizons = projectionJson.arrayValue("horizons").let { arr -> (0 until arr.length()).map { NetWorthProjection.fromJson(arr.getJSONObject(it)) } },
                     disclaimer = projectionJson.stringValue("disclaimer"),
                 ),
             )
@@ -303,7 +310,29 @@ data class Assumptions(
     }
 }
 
-data class HistorySnapshot(val date: String, val netWorth: Double)
+data class HistorySnapshot(
+    val date: String,
+    val netWorth: Double,
+    val id: Int = 0,
+    val assets: Double? = null,
+    val liabilities: Double? = null,
+    val savingsRate: Double? = null,
+    val source: String = "auto",
+    val note: String = "",
+) {
+    companion object {
+        fun fromJson(row: JSONObject) = HistorySnapshot(
+            date = row.stringValue("date"),
+            netWorth = row.numberValue("net_worth"),
+            id = row.optInt("id", 0),
+            assets = if (row.isNull("assets")) null else row.numberValue("assets"),
+            liabilities = if (row.isNull("liabilities")) null else row.numberValue("liabilities"),
+            savingsRate = if (row.isNull("savings_rate")) null else row.numberValue("savings_rate"),
+            source = row.stringValue("source", "auto"),
+            note = row.stringValue("note"),
+        )
+    }
+}
 
 data class ProjectionResponse(
     val scenario: String = "base",

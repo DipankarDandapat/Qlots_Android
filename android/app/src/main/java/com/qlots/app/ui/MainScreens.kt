@@ -51,6 +51,7 @@ fun OverviewScreen(
     onOpenWealth: () -> Unit,
     onOpenCashflow: () -> Unit,
     onOpenPlan: () -> Unit,
+    onOpenOutlook: (Int) -> Unit = {},
 ) {
     val dashboard = state.dashboard ?: FinancialDashboard()
     val monthly = dashboard.monthly
@@ -63,7 +64,8 @@ fun OverviewScreen(
                 Column(Modifier.align(Alignment.CenterStart).padding(end = 94.dp)) {
                     Text("NET WORTH", color = Color(0xFF7BA898), fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
                     Text(money(dashboard.netWorth), color = Color.White, fontSize = 31.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = (-1).sp, modifier = Modifier.padding(top = 5.dp))
-                    Text("as of ${dashboard.asOf.ifBlank { "—" }}", color = Color(0xFF9AB4A5), fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp))
+                    Text("as of ${prettyDate(dashboard.asOf)}", color = Color(0xFF9AB4A5), fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp))
+                    Text("Refreshes every night at 12:00 AM", color = Color(0xFF7BA898), fontSize = 9.sp, modifier = Modifier.padding(top = 2.dp))
                 }
                 Column(Modifier.align(Alignment.TopEnd), horizontalAlignment = Alignment.CenterHorizontally) {
                     HealthGauge(dashboard.health.score)
@@ -73,8 +75,8 @@ fun OverviewScreen(
             if (state.history.size > 1) {
                 Sparkline(state.history, Modifier.padding(top = 15.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(state.history.first().date, color = Color(0xFF7BA898), fontSize = 9.sp)
-                    Text(state.history.last().date, color = Color(0xFF7BA898), fontSize = 9.sp)
+                    Text(shortDate(state.history.first().date) + " " + state.history.first().date.take(4), color = Color(0xFF7BA898), fontSize = 9.sp)
+                    Text(shortDate(state.history.last().date) + " " + state.history.last().date.take(4), color = Color(0xFF7BA898), fontSize = 9.sp)
                 }
             }
             HorizontalDivider(color = Color(0xFF365744), modifier = Modifier.padding(top = 16.dp, bottom = 13.dp))
@@ -132,11 +134,13 @@ fun OverviewScreen(
         }
 
         QSection("Your outlook", "Explore", onOpenPlan)
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            ProjectionTile("1 YEAR · PROJECTED", dashboard.projections.oneYear, false, Modifier.weight(1f))
-            ProjectionTile("5 YEARS · PROJECTED", dashboard.projections.fiveYear, true, Modifier.weight(1f))
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            val horizons = dashboard.projections.horizons.ifEmpty { listOf(dashboard.projections.oneYear, dashboard.projections.fiveYear) }
+            horizons.forEach { projection ->
+                ProjectionTile(projection, dark = projection.year == 5, onViewMore = { onOpenOutlook(projection.year) })
+            }
         }
-        Text("Model-based estimates, not guaranteed returns.", color = QlotsColors.Muted, fontSize = 10.sp, modifier = Modifier.padding(start = 3.dp, top = 8.dp))
+        Text("Model-based estimates, not guaranteed returns. Tap View more to see every asset's calculation.", color = QlotsColors.Muted, fontSize = 10.sp, modifier = Modifier.padding(start = 3.dp, top = 8.dp))
 
         QSection("Financial health", "View insights", onOpenPlan)
         HealthDetail(dashboard)
@@ -161,15 +165,20 @@ private fun QuickStat(label: String, value: String, color: Color, background: Co
 }
 
 @Composable
-private fun ProjectionTile(eyebrow: String, projection: NetWorthProjection, dark: Boolean, modifier: Modifier = Modifier) {
+private fun ProjectionTile(projection: NetWorthProjection, dark: Boolean, onViewMore: () -> Unit) {
     val background = if (dark) QlotsColors.Deep else Color.White
     val primary = if (dark) Color.White else QlotsColors.Ink
     val secondary = if (dark) Color(0xFF9DBAA9) else QlotsColors.Muted
-    Column(modifier.background(background, RoundedCornerShape(19.dp)).padding(14.dp)) {
-        Text(eyebrow, color = secondary, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
-        Text("Year ${projection.year}", color = secondary, fontSize = 10.sp, modifier = Modifier.padding(top = 5.dp))
-        Text(money(projection.netWorth, true), color = primary, fontSize = 17.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
-        Text("assumption-based", color = secondary, fontSize = 9.sp, modifier = Modifier.padding(top = 3.dp))
+    val accent = if (dark) QlotsColors.Lime else QlotsColors.Green
+    Column(
+        Modifier.width(176.dp).background(background, RoundedCornerShape(19.dp)).clickableNoRipple(onViewMore).padding(14.dp),
+    ) {
+        Text("${projection.year} ${if (projection.year == 1) "YEAR" else "YEARS"} · PROJECTED", color = secondary, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)
+        Text("by ${prettyDate(projection.date)}", color = secondary, fontSize = 10.sp, modifier = Modifier.padding(top = 5.dp))
+        Text(money(projection.netWorth, true), color = primary, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(top = 7.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text("≈ ${money(projection.realNetWorth, true)} in today's money", color = secondary, fontSize = 9.sp, modifier = Modifier.padding(top = 3.dp), maxLines = 1)
+        if (projection.financialYearEnd.isNotBlank()) Text("FY ends ${shortDate(projection.financialYearEnd)} ${projection.financialYearEnd.take(4)}", color = secondary, fontSize = 9.sp, modifier = Modifier.padding(top = 2.dp), maxLines = 1)
+        Text("View more  ›", color = accent, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 10.dp))
     }
 }
 
@@ -305,51 +314,10 @@ fun CashflowScreen(
 }
 
 @Composable
-fun HistoryScreen(history: List<HistorySnapshot>) {
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp).padding(bottom = 24.dp)) {
-        PageHeading("Net-worth history", "Daily snapshots based on your saved records.")
-        QCard {
-            if (history.size < 2) {
-                EmptyState("Your timeline starts here", "Save or update your finances on different days to build a history.")
-            } else {
-                Sparkline(history, Modifier.height(115.dp))
-                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(history.first().date, color = QlotsColors.Muted, fontSize = 10.sp)
-                    Text(history.last().date, color = QlotsColors.Muted, fontSize = 10.sp)
-                }
-            }
-        }
-        QSection("Snapshots")
-        if (history.isEmpty()) {
-            QCard { EmptyState("No snapshots yet", "A snapshot is saved when Qlots loads your dashboard.") }
-        } else {
-            history.asReversed().forEachIndexed { index, row ->
-                val previous = history.asReversed().getOrNull(index + 1)
-                QCard(modifier = Modifier.padding(bottom = 9.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(row.date, color = QlotsColors.Muted, fontSize = 11.sp)
-                            Text(money(row.netWorth), color = QlotsColors.Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 4.dp))
-                        }
-                        if (previous != null) {
-                            val delta = row.netWorth - previous.netWorth
-                            Text("${if (delta >= 0) "+" else ""}${money(delta)}", color = if (delta >= 0) QlotsColors.Green else QlotsColors.Red, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
-                }
-            }
-        }
-        Text("History is based on the figures entered and saved in your account.", color = QlotsColors.Muted, fontSize = 10.sp, modifier = Modifier.padding(4.dp))
-    }
-}
-
-@Composable
-fun PlanScreen(
+fun AssumptionsPanel(
     state: QlotsUiState,
     onSaveAssumptions: (Assumptions) -> Unit,
     onScenario: (String) -> Unit,
-    onAskHelper: (String) -> Unit,
-    onCreatePdf: () -> Unit,
 ) {
     val assumptions = state.assumptions
     var salaryGrowth by remember(assumptions) { mutableStateOf(assumptions.salaryGrowth.toInput()) }
@@ -357,10 +325,8 @@ fun PlanScreen(
     var propertyGrowth by remember(assumptions) { mutableStateOf(assumptions.propertyGrowth.toInput()) }
     var inflation by remember(assumptions) { mutableStateOf(assumptions.inflation.toInput()) }
     var monthlyInvestment by remember(assumptions) { mutableStateOf(assumptions.monthlyInvestment.toInput()) }
-    var question by rememberSaveable { mutableStateOf("") }
     val forecast = state.forecast
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp).padding(bottom = 25.dp)) {
-        PageHeading("Plan & insights", "Explore assumptions; estimates are not predictions.")
+    Column {
         QCard {
             Text("Projection assumptions", color = QlotsColors.Deep, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Text("Adjust rates to see how a five-year model changes. Actual outcomes may differ.", color = QlotsColors.Muted, fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 5.dp, bottom = 12.dp))
@@ -387,6 +353,17 @@ fun PlanScreen(
         }
         if (forecast != null) ForecastCard(forecast)
         else QCard(modifier = Modifier.padding(top = 11.dp)) { EmptyState("No projection yet", "Save assumptions to calculate your current scenario.") }
+    }
+}
+
+@Composable
+fun AssistantPanel(
+    state: QlotsUiState,
+    onAskHelper: (String) -> Unit,
+    onCreatePdf: () -> Unit,
+) {
+    var question by rememberSaveable { mutableStateOf("") }
+    Column {
         QCard(modifier = Modifier.padding(top = 13.dp)) {
             Text("Calculation-backed helper", color = QlotsColors.Deep, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Text("Ask about the records you entered. Answers use server-side calculations and are not an AI financial adviser.", color = QlotsColors.Muted, fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 5.dp, bottom = 12.dp))
